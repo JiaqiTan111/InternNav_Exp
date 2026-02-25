@@ -1,0 +1,45 @@
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% Preliminary: 任务定义与符号 -> Token caching静态范式
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{Preliminary}
+\label{sec:preliminary}
+
+% 2.1: VLN任务定义与VLA推理形式
+\subsection{Vision-Language Navigation}
+
+Vision-and-Language Navigation (VLN) requires an embodied agent to execute an instruction $L$ while moving in an unseen 3D environment~\cite{VLN_servey1, VLN_servey2}.
+At navigation step $t$, the agent receives observation $o_t$ and maintains trajectory history $H_t$.
+Action prediction can be written as:
+\begin{equation}
+a_t = \arg\max_{a} P\left(a \mid o_t, L, H_t; \theta\right),
+\label{eq:prelim-vln}
+\end{equation}
+where $\theta$ denotes model parameters.
+In VLA-style VLN models, each observation is encoded as visual tokens $\{v_t^{(i)}\}_{i=1}^{M}$ and fused with language features for autoregressive reasoning.
+The model output can be represented as low-level control or waypoint actions, depending on the navigation formulation.
+Due to the sequential and multi-modal nature of VLN, each navigation step involves dense visual encoding across all $M$ tokens, incurring substantial per-step latency that conflicts with the real-time demands of robotic deployment.
+
+% 2.2: Token caching静态范式
+\subsection{Token Caching}
+
+Token caching accelerates inference by reusing cross-frame states for redundant tokens~\cite{vlacache, stcache, token_merging, EgoPrune}.
+Given adjacent observations, a static token caching decision rule is
+\begin{equation}
+\hat{K}_{t}^{(i)}=
+\begin{cases}
+K_{t-1}^{(i)}, & \text{if } \mathrm{sim}\left(p_t^{(i)}, p_{t-1}^{(i)}\right) > \tau,\\
+f_K\left(v_t^{(i)}\right), & \text{otherwise},
+\end{cases},
+\label{eq:prelim-cache}
+\end{equation}
+where $p_t^{(i)}$ is the feature of token $i$, $\tau$ is a reuse threshold, and $f_K(\cdot)$ computes updated keys.
+The same reuse decision is applied to key-value states across transformer layers.
+Let $\mathcal{C}_t^{\ell}$ be the reused token set at layer $\ell$ and step $t$.
+Its reuse ratio is
+\begin{equation}
+r_t^{\ell}=\frac{|\mathcal{C}_t^{\ell}|}{M},
+\label{eq:prelim-reuse-ratio}
+\end{equation}
+with $M$ visual tokens per step.
+Existing methods instantiate this paradigm with various similarity metrics and filtering strategies~\cite{vlacache, stcache, token_merging, EgoPrune}.
+This static formulation serves as the direct baseline for our study.

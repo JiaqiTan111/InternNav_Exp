@@ -1,0 +1,40 @@
+\begin{table}[!b]
+    \centering
+    \vskip -0.2 in
+    \setlength{\tabcolsep}{1.4mm}
+    \caption{Simulation Results of \textit{HeiSD}}
+    \vskip -0.05 in
+    \label{tab:6-1}
+    \scriptsize
+    \begin{tabular}{c|c|c|c|c|c|c}
+    \toprule
+    \toprule
+    {\textbf{Env.}} & \textbf{Method} & {\textbf{SR}} & \textbf{Speed} & \textbf{AL} & \textbf{Steps} & \textbf{HW} \\
+    \midrule
+    \multirow{5}{*}{LIBERO-Goal} & \cellcolor{gray!20}{AR w/o SD} & \cellcolor{gray!20}{77.0\%} & \cellcolor{gray!20}{1.00$\times$} & \cellcolor{gray!20}{--} & \cellcolor{gray!20}{157.6} & \cellcolor{gray!20}{GPU} \\
+    ~ & \cellcolor{pink!20}{Pure R-SD} & \cellcolor{pink!20}{77.0\%} & \cellcolor{pink!20}{0.96$\times$} & \cellcolor{pink!20}{1.03} & \cellcolor{pink!20}{152.6} & \cellcolor{pink!20}{CPU+GPU} \\
+    ~ & \cellcolor{orange!20}{Pure D-SD} & \cellcolor{orange!20}{76.2\%} & \cellcolor{orange!20}{0.87$\times$} & \cellcolor{orange!20}{1.68} & \cellcolor{orange!20}{159.2} & \cellcolor{orange!20}{GPU} \\
+    ~ & \cellcolor{yellow!20}{SpecVLA} & \cellcolor{yellow!20}{71.0\%} & \cellcolor{yellow!20}{1.23$\times$} & \cellcolor{yellow!20}{3.63} & \cellcolor{yellow!20}{166.8} & \cellcolor{yellow!20}{GPU} \\
+    ~ & \cellcolor{green!20}{\textbf{\textit{HeiSD}}} & \cellcolor{green!20}{\textbf{73.0\%}} & \cellcolor{green!20}{\textbf{2.38$\times$}} & \cellcolor{green!20}{\textbf{4.75}} & \cellcolor{green!20}{\textbf{156.3}} & \cellcolor{green!20}{\textbf{CPU+GPU}} \\
+    \cmidrule{1-7}
+    \multirow{5}{*}{LIBERO-Object} & \cellcolor{gray!20}{AR w/o SD} & \cellcolor{gray!20}{71.2\%} & \cellcolor{gray!20}{1.00$\times$} & \cellcolor{gray!20}{--} & \cellcolor{gray!20}{191.7} & \cellcolor{gray!20}{GPU} \\
+    ~ & \cellcolor{pink!20}{Pure R-SD} & \cellcolor{pink!20}{76.0\%} & \cellcolor{pink!20}{0.98$\times$} & \cellcolor{pink!20}{0.93} & \cellcolor{pink!20}{195.4} & \cellcolor{pink!20}{GPU} \\
+    ~ & \cellcolor{orange!20}{Pure D-SD} & \cellcolor{orange!20}{68.6\%} & \cellcolor{orange!20}{0.96$\times$} & \cellcolor{orange!20}{1.84} & \cellcolor{orange!20}{195.9} & \cellcolor{orange!20}{GPU} \\
+    ~ & \cellcolor{yellow!20}{SpecVLA} & \cellcolor{yellow!20}{62.4\%} & \cellcolor{yellow!20}{1.10$\times$}  & \cellcolor{yellow!20}{3.91} & \cellcolor{yellow!20}{214.5} & \cellcolor{yellow!20}{GPU}\\
+    ~ & \cellcolor{green!20}{\textbf{\textit{HeiSD}}} & \cellcolor{green!20}{\textbf{71.0\%}} & \cellcolor{green!20}{\textbf{2.45$\times$}} & \cellcolor{green!20}{\textbf{4.94}} & \cellcolor{green!20}{\textbf{189.6}} & \cellcolor{green!20}{\textbf{CPU+GPU}} \\
+    \cmidrule{1-7}
+    \multirow{5}{*}{LIBERO-Spatial} & \cellcolor{gray!20}{AR w/o SD} & \cellcolor{gray!20}{82.8\%} & \cellcolor{gray!20}{1.00$\times$} & \cellcolor{gray!20}{--} & \cellcolor{gray!20}{126.9} & \cellcolor{gray!20}{GPU} \\
+    ~ & \cellcolor{pink!20}{pure R-SD} & \cellcolor{pink!20}{78.0\%} & \cellcolor{pink!20}{1.15$\times$} & \cellcolor{pink!20}{0.81} & \cellcolor{pink!20}{123.5} & \cellcolor{pink!20}{GPU} \\
+    ~ & \cellcolor{orange!20}{Pure D-SD} & \cellcolor{orange!20}{82.8\%} & \cellcolor{orange!20}{0.98$\times$} & \cellcolor{orange!20}{1.65} & \cellcolor{orange!20}{127.3} & \cellcolor{orange!20}{GPU} \\
+    ~ & \cellcolor{yellow!20}{SpecVLA} & \cellcolor{yellow!20}{\textbf{80.4\%}} & \cellcolor{yellow!20}{1.26$\times$}  & \cellcolor{yellow!20}{3.80} & \cellcolor{yellow!20}{128.7} & \cellcolor{yellow!20}{GPU} \\
+    ~ & \cellcolor{green!20}{\textbf{\textit{HeiSD}}} & \cellcolor{green!20}{\textbf{78.0\%}} & \cellcolor{green!20}{\textbf{1.90$\times$}} & \cellcolor{green!20}{\textbf{4.83}} & \cellcolor{green!20}{\textbf{127.8}} & \cellcolor{green!20}{\textbf{CPU+GPU}} \\
+    \cmidrule{1-7}
+    \multirow{5}{*}{LIBERO-Long} & \cellcolor{gray!20}{AR w/o SD} & \cellcolor{gray!20}{54.4\%} & \cellcolor{gray!20}{1.00$\times$} & \cellcolor{gray!20}{--} & \cellcolor{gray!20}{393.2} & \cellcolor{gray!20}{GPU} \\
+    ~ & \cellcolor{pink!20}{Pure R-SD} & \cellcolor{pink!20}{50.0\%} & \cellcolor{pink!20}{0.99$\times$} & \cellcolor{pink!20}{0.81} & \cellcolor{pink!20}{399.3} & \cellcolor{pink!20}{GPU} \\
+    ~ & \cellcolor{orange!20}{Pure D-SD} & \cellcolor{orange!20}{50.2\%} & \cellcolor{orange!20}{0.91$\times$} & \cellcolor{orange!20}{1.59} & \cellcolor{orange!20}{400.7} & \cellcolor{orange!20}{GPU} \\
+    ~ & \cellcolor{yellow!20}{SpecVLA} & \cellcolor{yellow!20}{\textbf{46.2\%}} & \cellcolor{yellow!20}{1.13$\times$} & \cellcolor{yellow!20}{3.63} & \cellcolor{yellow!20}{439.6} & \cellcolor{yellow!20}{GPU} \\
+    ~ & \cellcolor{green!20}{\textbf{\textit{HeiSD}}} & \cellcolor{green!20}{\textbf{47.0\%}} & \cellcolor{green!20}{\textbf{1.79$\times$}} & \cellcolor{green!20}{\textbf{4.96}} & \cellcolor{green!20}{\textbf{428.0}} & \cellcolor{green!20}{\textbf{CPU+GPU}} \\
+    \bottomrule
+    \bottomrule
+    \end{tabular}
+\end{table}

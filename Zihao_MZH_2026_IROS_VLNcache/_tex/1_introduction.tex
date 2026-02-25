@@ -1,0 +1,58 @@
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% Introduction: 引出问题背景 -> 现有方法局限 -> 我们的方案 -> 贡献点
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{INTRODUCTION}
+\label{sec:introduction}
+
+% 背景：VLN任务的重要性和应用场景 - 满意
+Vision-and-Language Navigation (VLN) enables embodied agents to follow natural language instructions in complex, unstructured environments~\cite{VLN_servey1, VLN_servey2}.
+It has become a mainstream paradigm in the field of embodied intelligence~\cite{VL_Nav, IROS_VLN}.
+However, the computational demands of VLN models fundamentally conflict with the real-time navigation requirements of practical robotic deployment~\cite{HIAI}.
+
+\begin{figure*}[!t]
+\centering
+\includegraphics[width=\textwidth]{fig/placeholder_double.png}
+\caption{Overview Placeholder for Observation and Motivation in VLN token caching.}
+\label{fig:analysis-overview}
+\end{figure*}
+
+% VLN加速SOTA：模型架构创新、压缩、运行时优化 - Sota已经讲好了
+Existing acceleration approaches for VLN primarily follow three directions: efficient architectures, model compression, and runtime optimization.
+Efficient architectures design lightweight networks to reduce inherent complexity~\cite{efficientvln,etp_r1, LOGNav}.
+Compression techniques like quantization shrink model size while preserving predictive capabilities~\cite{MiniVLN, NaVILA}.
+Runtime optimization dynamically reduces computations during inference without altering model parameters~\cite{NAPVLN, NavEE, Uni-NaVid}.
+These methods have substantially improved VLN inference efficiency.
+
+% 引出 Token caching,并介绍Token caching核心直觉：时序连贯性 + 检测-复用范式 - 合并，并去掉细节表达，highlevel化
+Token caching has emerged as a highly promising training-free runtime optimization technique.
+It exploits temporal coherence: background regions such as walls and floors change little across adjacent frames, so their visual tokens can be safely reused rather than recomputed~\cite{vlacache,stcache, token_sparsification, EgoPrune}.
+Following a detect-and-reuse paradigm, existing methods selectively skip the computation of tokens identified as static or task-irrelevant, achieving substantial speedup with minimal accuracy loss in fixed-camera or static-scene settings~\cite{vlacache, token_merging, stcache, EgoPrune, token_sparsification, Learn_VLA_cache}.
+
+% SOTA Gap：静态/固定假设在VLN中失效
+However, existing token caching methods are built on a static-view assumption: patches at the same image position are expected to remain similar across adjacent frames~\cite{vlacache}.
+This assumption breaks in VLN, where the agent continuously translates and rotates during navigation~\cite{View_Invariant_Learning}.
+As a result, physically static objects can shift substantially in image coordinates, making position-wise matching underestimate reusable tokens.
+In addition, navigation is instruction-conditioned and temporally staged.
+A landmark that is critical before a turn can quickly become irrelevant after the agent passes it, so semantic relevance changes even when appearance is stable.
+These two dynamics jointly limit the direct transfer of static-scene caching strategies to embodied navigation.
+
+% Analysis → Insight：点明做了分析，概括发现，引出方法
+To investigate these dynamics, we conduct an empirical analysis of visual token behavior and instruction-conditioned region relevance across VLN trajectories.
+Our analysis reveals two consistent patterns: physically static regions frequently appear dissimilar across adjacent frames due to viewpoint changes during navigation, and the task relevance of landmark regions varies substantially over the course of a trajectory.
+
+% 方法概述：VLN-Cache双重感知框架
+Motivated by these findings, we propose \textit{VLN-Cache}, a dual-aware token caching framework for VLN.
+For visual dynamics, we perform view-aware feature alignment before cross-frame matching, which recovers reusable tokens that would be missed by position-wise comparison.
+For semantic dynamics, we introduce instruction-guided saliency monitoring that refreshes cached tokens when their task relevance changes.
+To control the additional overhead, we further adopt an entropy-based layer-adaptive reuse schedule that allocates conservative reuse to sensitive layers and more aggressive reuse to stable layers.
+The resulting framework delivers practical inference acceleration while preserving overall navigation performance.
+
+% 贡献点
+Our key contributions are as follows.
+\begin{itemize}
+\item We provide empirical evidence that static-scene caching assumptions fail in VLN due to viewpoint-induced mismatch and temporal semantic shift.
+\item We present \textit{VLN-Cache}, a dual-aware framework that combines view-aware matching with instruction-guided semantic refresh, without architectural changes or retraining.
+\item We design an entropy-based layer-adaptive reuse strategy to balance acceleration gain and computational overhead across transformer layers.
+\end{itemize}
+
+Experimental results demonstrate that \textit{VLN-Cache} achieves a speedup of up to xxx$\times$ on standard VLN benchmarks, while maintaining competitive navigation success rates, supporting practical real-time embodied deployment.

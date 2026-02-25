@@ -1,0 +1,1451 @@
+import argparse
+import json
+import os
+import sys
+import time
+from enum import IntEnum
+
+sys.path.append('./src/diffusion-policy')
+import copy
+import itertools
+import random
+import re
+from collections import OrderedDict
+
+import cv2
+import habitat
+import numpy as np
+import quaternion
+import torch
+import tqdm
+from depth_camera_filtering import filter_depth
+from habitat.config.default import get_agent_config
+from habitat.config.default_structured_configs import (
+    CollisionsMeasurementConfig,
+    FogOfWarConfig,
+    TopDownMapMeasurementConfig,
+)
+from habitat.tasks.nav.shortest_path_follower import ShortestPathFollower
+from habitat.utils.visualizations.utils import images_to_video, observations_to_image
+from habitat_baselines.config.default import get_config as get_habitat_config
+from PIL import Image
+from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
+
+from internnav.configs.evaluator import EvalCfg
+from internnav.evaluator import DistributedEvaluator, Evaluator
+from internnav.habitat_extensions.vln.utils import (
+    get_axis_align_matrix,
+    get_intrinsic_matrix,
+    pixel_to_gps,
+    preprocess_depth_image_v2,
+    xyz_yaw_pitch_to_tf_matrix,
+)
+from internnav.model.basemodel.internvla_n1.internvla_n1 import InternVLAN1ForCausalLM
+from internnav.model.utils.vln_utils import split_and_clean, traj_to_actions
+from vis_analyze_new.runtime import (
+    ObservationDataWriterV2,
+    VisualTokenHook,
+    compute_patch_cosine_stats,
+    probe_language_vision_saliency,
+)
+
+# Import for Habitat registry side effects — do not remove
+import internnav.habitat_extensions.vln.measures  # noqa: F401 # isort: skip
+
+# ── VLN-Cache (training-free KV reuse) ──────────────────────────────
+try:
+    from internnav.vln_cache.evaluator_integration import VLNCacheHook
+    _VLN_CACHE_AVAILABLE = True
+except ImportError:
+    _VLN_CACHE_AVAILABLE = False
+
+
+DEFAULT_IMAGE_TOKEN = "<image>"
+
+MAX_STEPS = 8
+MAX_LOCAL_STEPS = 4
+
+
+class action_code(IntEnum):
+    STOP = 0
+    FORWARD = 1
+    LEFT = 2
+    RIGHT = 3
+    LOOKUP = 4
+    LOOKDOWN = 5
+
+
+@Evaluator.register('habitat_vln')
+class HabitatVLNEvaluator(DistributedEvaluator):
+    def __init__(self, cfg: EvalCfg):
+        args = argparse.Namespace(**cfg.eval_settings)
+        self.save_video = args.save_video
+        self.epoch = args.epoch
+        self.max_steps_per_episode = args.max_steps_per_episode
+        self.max_episodes = int(getattr(args, 'max_episodes', 0))
+        self.output_path = args.output_path
+        self.analysis_enable_step_log = bool(getattr(args, 'analysis_enable_step_log', False))
+        self.analysis_collect_s2_log = bool(getattr(args, 'analysis_collect_s2_log', False))
+        self.analysis_alignment_enable = bool(getattr(args, 'analysis_alignment_enable', True))
+        self.analysis_dump_dir = getattr(args, 'analysis_dump_dir', './vis_analyze_new/data/raw')
+        self.analysis_patch_size = int(getattr(args, 'analysis_patch_size', 28))
+        self.analysis_similarity_resize = int(getattr(args, 'analysis_similarity_resize', 392))
+        self.analysis_similarity_tau = float(getattr(args, 'analysis_similarity_tau', 0.7))
+        self.analysis_alignment_method = str(getattr(args, 'analysis_alignment_method', 'depth_pose'))
+        self.analysis_alignment_neighbor_radius = int(getattr(args, 'analysis_alignment_neighbor_radius', 1))
+        self.analysis_alignment_occlusion_eps_mm = float(getattr(args, 'analysis_alignment_occlusion_eps_mm', 250.0))
+        self.analysis_probe_attn = bool(getattr(args, 'analysis_probe_attn', False))
+        self.analysis_probe_every_n_steps = int(getattr(args, 'analysis_probe_every_n_steps', 1))
+        self.analysis_save_patch_tokens = bool(getattr(args, 'analysis_save_patch_tokens', False))
+        self.analysis_save_rgbd = bool(getattr(args, 'analysis_save_rgbd', False))
+        self.analysis_attn_implementation = getattr(args, 'analysis_attn_implementation', 'flash_attention_2')
+
+        # create habitat config
+        self.config_path = cfg.env.env_settings['config_path']
+        self.config = get_habitat_config(self.config_path)
+        self.agent_config = get_agent_config(self.config.habitat.simulator)
+        self.sim_sensors_config = self.config.habitat.simulator.agents.main_agent.sim_sensors
+
+        with habitat.config.read_write(self.config):
+            self.config.habitat.task.measurements.update(
+                {
+                    "top_down_map": TopDownMapMeasurementConfig(
+                        map_padding=3,
+                        map_resolution=1024,
+                        draw_source=True,
+                        draw_border=True,
+                        draw_shortest_path=True,
+                        draw_view_points=True,
+                        draw_goal_positions=True,
+                        draw_goal_aabbs=True,
+                        fog_of_war=FogOfWarConfig(
+                            draw=True,
+                            visibility_dist=5.0,
+                            fov=90,
+                        ),
+                    ),
+                    "collisions": CollisionsMeasurementConfig(),
+                }
+            )
+        cfg.env.env_settings['habitat_config'] = self.config
+        cfg.env.env_settings['output_path'] = self.output_path
+
+        # init agent and env
+        super().__init__(cfg, init_agent=False)
+
+        # ------------------------------------- model ------------------------------------------
+        self.model_args = argparse.Namespace(**cfg.agent.model_settings)
+
+        processor = AutoProcessor.from_pretrained(self.model_args.model_path)
+        processor.tokenizer.padding_side = 'left'
+
+        device = torch.device(f"cuda:{self.local_rank}")
+        if self.model_args.mode == 'dual_system':
+            model = InternVLAN1ForCausalLM.from_pretrained(
+                self.model_args.model_path,
+                torch_dtype=torch.bfloat16,
+                attn_implementation=self.analysis_attn_implementation,
+                device_map={"": device},
+            )
+        elif self.model_args.mode == 'system2':
+            model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                self.model_args.model_path,
+                torch_dtype=torch.bfloat16,
+                attn_implementation=self.analysis_attn_implementation,
+                device_map={"": device},
+            )
+        else:
+            raise ValueError(f"Invalid mode: {self.model_args.mode}")
+
+        model.eval()
+        self.device = device
+
+        self.model = model
+        self.processor = processor
+
+        # refactor: this part used in three places
+        prompt = "You are an autonomous navigation assistant. Your task is to <instruction>. Where should you go next to stay on track? Please output the next waypoint\'s coordinates in the image. Please output STOP when you have successfully completed the task."
+        answer = ""
+        self.conversation = [{"from": "human", "value": prompt}, {"from": "gpt", "value": answer}]
+
+        self.conjunctions = [
+            'you can see ',
+            'in front of you is ',
+            'there is ',
+            'you can spot ',
+            'you are toward the ',
+            'ahead of you is ',
+            'in your sight is ',
+        ]
+
+        self.actions2idx = OrderedDict(
+            {
+                'STOP': [0],
+                "↑": [1],
+                "←": [2],
+                "→": [3],
+                "↓": [5],
+            }
+        )
+
+        self.num_history = self.model_args.num_history
+
+        self._camera_height = self.sim_sensors_config.rgb_sensor.position[1]
+        self._min_depth = self.sim_sensors_config.depth_sensor.min_depth
+        self._max_depth = self.sim_sensors_config.depth_sensor.max_depth
+
+        camera_fov_rad = np.deg2rad(self.sim_sensors_config.depth_sensor.hfov)
+        self._camera_fov = camera_fov_rad
+        self._fx = self._fy = self.sim_sensors_config.depth_sensor.width / (2 * np.tan(camera_fov_rad / 2))
+
+        self.analysis_writer = None
+        if self.analysis_enable_step_log:
+            self.analysis_writer = ObservationDataWriterV2(
+                root_dir=self.analysis_dump_dir,
+                rank=self.rank,
+                mode=self.model_args.mode,
+                save_patch_tokens=self.analysis_save_patch_tokens,
+                save_rgbd=self.analysis_save_rgbd,
+            )
+        self.analysis_visual_hook = VisualTokenHook(
+            self.model,
+            enabled=self.analysis_enable_step_log and self.analysis_save_patch_tokens,
+        )
+
+        # ── VLN-Cache (optional, controlled by eval_settings) ──
+        self._vln_cache_enabled = bool(getattr(args, 'vln_cache_enabled', False))
+        self._vln_cache = None
+        if self._vln_cache_enabled and _VLN_CACHE_AVAILABLE:
+            self._vln_cache = VLNCacheHook.from_evaluator(self)
+            print("[VLN-Cache] Enabled – hooks registered on %d decoder layers" % self._vln_cache.manager.n_layers)
+        elif self._vln_cache_enabled and not _VLN_CACHE_AVAILABLE:
+            print("[VLN-Cache] Requested but internnav.vln_cache not importable; running without cache.")
+
+    def eval_action(self):
+        """
+        Run local episodes on this rank.
+
+        Returns dict[str, Tensor] on GPU (1D tensors of same length).
+        """
+        # Old behavior was something like:
+        # sucs, spls, oss, nes, ep_num = self.eval_action(self.rank)
+        # Now just implement the actual eval here and return dict.
+
+        tls_t, strs_t, ones_t, cache_reuses_t, cache_ohs_t = None, None, None, None, None
+        latencies_t, freqs_t, gpu_mems_t = None, None, None
+        if self.model_args.mode == 'dual_system':
+            sucs, spls, oss, nes, ndtws, tls_t, strs_t, ones_t, cache_reuses_t, cache_ohs_t, latencies_t, freqs_t, gpu_mems_t = self._run_eval_dual_system()
+        elif self.model_args.mode == 'system2':
+            sucs, spls, oss, nes, ndtws = self._run_eval_system2()
+        else:
+            raise ValueError(f"Invalid mode: {self.model_args.mode}")
+
+        result = {
+            "sucs": sucs,  # shape [N_local]
+            "spls": spls,  # shape [N_local]
+            "oss": oss,  # shape [N_local]
+            "nes": nes,  # shape [N_local]
+        }
+
+        if ndtws is not None:
+            result["ndtws"] = ndtws  # shape [N_local]
+        if tls_t is not None:
+            result["tls"] = tls_t
+        if strs_t is not None:
+            result["strs"] = strs_t
+        if ones_t is not None:
+            result["ones"] = ones_t
+        if cache_reuses_t is not None:
+            result["cache_reuses"] = cache_reuses_t
+        if cache_ohs_t is not None:
+            result["cache_ohs"] = cache_ohs_t
+        if latencies_t is not None:
+            result["latencies"] = latencies_t
+        if freqs_t is not None:
+            result["freqs"] = freqs_t
+        if gpu_mems_t is not None:
+            result["gpu_mems"] = gpu_mems_t
+        return result
+
+    def calc_metrics(self, global_metrics: dict) -> dict:
+        """
+        global_metrics["sucs"] etc. are global 1-D CPU tensors with all episodes.
+        """
+        sucs_all = global_metrics["sucs"]
+        spls_all = global_metrics["spls"]
+        oss_all = global_metrics["oss"]
+        nes_all = global_metrics["nes"]
+
+        # avoid /0 if no episodes
+        denom = max(len(sucs_all), 1)
+
+        # clean NaN in spls, treat as 0.0
+        torch.nan_to_num(spls_all, nan=0.0, posinf=0.0, neginf=0.0, out=spls_all)
+
+        # clean inf in nes, only fiinite nes are counted
+        nes_finite_mask = torch.isfinite(nes_all)
+        nes_all = nes_all[nes_finite_mask]
+
+        result_all = {
+            "sucs_all": float(sucs_all.mean().item()) if denom > 0 else 0.0,
+            "spls_all": float(spls_all.mean().item()) if denom > 0 else 0.0,
+            "oss_all": float(oss_all.mean().item()) if denom > 0 else 0.0,
+            "nes_all": float(nes_all.mean().item()) if denom > 0 else 0.0,
+            # "length" will be filled by base class
+        }
+
+        if "ndtws" in global_metrics:
+            ndtws_all = global_metrics["ndtws"]
+            result_all["ndtws_all"] = float(ndtws_all.mean().item()) if denom > 0 else 0.0
+
+        if "tls" in global_metrics:
+            result_all["tls_all"] = float(global_metrics["tls"].mean().item())
+        if "strs" in global_metrics:
+            result_all["strs_all"] = float(global_metrics["strs"].mean().item())
+        if "ones" in global_metrics:
+            ones_v = global_metrics["ones"]
+            ones_finite = ones_v[torch.isfinite(ones_v)]
+            result_all["ones_all"] = float(ones_finite.mean().item()) if len(ones_finite) > 0 else 0.0
+        if "cache_reuses" in global_metrics:
+            result_all["cache_reuse_all"] = float(global_metrics["cache_reuses"].mean().item())
+        if "cache_ohs" in global_metrics:
+            result_all["cache_oh_all"] = float(global_metrics["cache_ohs"].mean().item())
+        if "latencies" in global_metrics:
+            result_all["latency_all"] = float(global_metrics["latencies"].mean().item())
+        if "freqs" in global_metrics:
+            result_all["freq_all"] = float(global_metrics["freqs"].mean().item())
+        if "gpu_mems" in global_metrics:
+            result_all["gpu_mem_all"] = float(global_metrics["gpu_mems"].mean().item())
+
+        return result_all
+
+    def parse_actions(self, output):
+        action_patterns = '|'.join(re.escape(action) for action in self.actions2idx)
+        # import ipdb; ipdb.set_trace()
+        regex = re.compile(action_patterns)
+        matches = regex.findall(output)
+        actions = [self.actions2idx[match] for match in matches]
+        actions = itertools.chain.from_iterable(actions)
+        return list(actions)
+
+    @staticmethod
+    def _quat_to_wxyz(rotation):
+        return [float(rotation.w), float(rotation.x), float(rotation.y), float(rotation.z)]
+
+    def resume_from_output_path(self) -> None:
+        sucs, spls, oss, nes, ndtw = [], [], [], [], []
+        tls, strs, ones, cache_reuses, cache_ohs = [], [], [], [], []
+        latencies, freqs, gpu_mems = [], [], []
+        if self.rank != 0:
+            return sucs, spls, oss, nes, ndtw, tls, strs, ones, cache_reuses, cache_ohs, latencies, freqs, gpu_mems
+
+        # resume from previous results
+        if os.path.exists(os.path.join(self.output_path, 'progress.json')):
+            with open(os.path.join(self.output_path, 'progress.json'), 'r') as f:
+                for line in f.readlines():
+                    res = json.loads(line)
+                    sucs.append(res['success'])
+                    spls.append(res['spl'])
+                    oss.append(res['os'])
+                    nes.append(res['ne'])
+                    if 'ndtw' in res:
+                        ndtw.append(res['ndtw'])
+                    if 'tl' in res:
+                        tls.append(res['tl'])
+                    if 'str' in res:
+                        strs.append(res['str'])
+                    if 'one' in res:
+                        ones.append(res['one'])
+                    if 'vln_cache' in res:
+                        cache_reuses.append(res['vln_cache'].get('mean_reuse_ratio', 0.0))
+                        cache_ohs.append(res['vln_cache'].get('cache_overhead_ms_mean', 0.0))
+                    if 'action_latency_ms' in res:
+                        latencies.append(res['action_latency_ms'])
+                    if 'control_freq_hz' in res:
+                        freqs.append(res['control_freq_hz'])
+                    if 'peak_gpu_mb' in res:
+                        gpu_mems.append(res['peak_gpu_mb'])
+        return sucs, spls, oss, nes, ndtw, tls, strs, ones, cache_reuses, cache_ohs, latencies, freqs, gpu_mems
+
+    def _run_eval_dual_system(self) -> tuple:
+        self.model.eval()
+
+        # resume from previous results
+        sucs, spls, oss, nes, ndtw, tls, strs, ones, cache_reuses, cache_ohs, latencies, freqs, gpu_mems = self.resume_from_output_path()
+
+        # Episode loop is now driven by env.reset() + env.is_running
+        target_episodes = len(self.env.episodes)
+        if self.max_episodes > 0:
+            target_episodes = min(target_episodes, self.max_episodes)
+        process_bar = tqdm.tqdm(total=target_episodes, desc=f"Eval Epoch {self.epoch} Rank {self.rank}")
+        finished_episodes = 0
+
+        while self.env.is_running:
+            if self.max_episodes > 0 and finished_episodes >= self.max_episodes:
+                break
+
+            # ------------ 1. Start of episode ------------
+            observations = self.env.reset()
+            if not self.env.is_running or observations is None:
+                break
+
+            # ---- episode meta (scene_id, episode_id, instruction) ----
+            # we get it from the underlying habitat env
+            episode = self.env.get_current_episode()
+            scene_id = episode.scene_id.split('/')[-2]
+            episode_id = int(episode.episode_id)
+            episode_instruction = episode.instruction.instruction_text
+            print("episode start", episode_instruction)
+
+            # save first frame per rank to validate sim quality
+            os.makedirs(os.path.join(self.output_path, f'check_sim_{self.epoch}'), exist_ok=True)
+            Image.fromarray(observations['rgb']).save(
+                os.path.join(self.output_path, f'check_sim_{self.epoch}', f'rgb_{self.rank}.jpg')
+            )
+
+            vis_frames = []
+            step_id = 0
+
+            # token stats for dual-system (system2 generation -> system1 latent generation)
+            sys2_prompt_lens = []
+            sys2_gen_lens = []
+            sys2_total_lens = []
+
+            if self.save_video:
+                os.makedirs(os.path.join(self.output_path, f'vis_{self.epoch}', f'{scene_id}'), exist_ok=True)
+
+            rgb_list = []
+            raw_rgb_list = []
+            raw_depth_list = []
+            camera_pose_list = []
+            yaw_list = []
+            action_seq = []
+            input_images = []
+            output_ids = None
+            llm_outputs = ""
+            action = None
+            messages = []
+            local_actions = []
+
+            done = False
+            flag = False
+            prev_camera_pose = None
+            # ── per-step position tracking for TL / StR ──
+            ep_positions = []  # list of np.array[3]
+            # ── per-step efficiency tracking ──
+            ep_step_latencies = []  # action latency per step (seconds)
+            torch.cuda.reset_peak_memory_stats(self.device)
+            pending_patch_token_path = None
+            pending_saliency_path = None
+            pixel_goal = None
+
+            # ── VLN-Cache: reset per-episode ──
+            if self._vln_cache is not None:
+                self._vln_cache.reset_episode()
+
+            # ---------- 2. Episode step loop -----------
+            while (not done) and (step_id <= self.max_steps_per_episode):
+                # refactor agent get action
+                rgb = observations["rgb"]
+                depth = observations["depth"]
+                x, y = observations["gps"]
+                camera_yaw = observations["compass"][0] if "compass" in observations else None
+                depth = filter_depth(depth.reshape(depth.shape[:2]), blur_type=None)
+                depth = depth * (self._max_depth - self._min_depth) + self._min_depth
+                depth = depth * 1000
+                front_depth = depth.copy()
+
+                image = Image.fromarray(rgb).convert('RGB')
+                save_raw_image = image.copy()
+
+                if action == action_code.LOOKDOWN:
+                    look_down_image = image
+                    save_raw_image = look_down_image.copy()
+                    look_down_depth, resize_shape = preprocess_depth_image_v2(
+                        Image.fromarray(depth.astype(np.uint16), mode='I;16'),
+                        do_depth_scale=True,
+                        depth_scale=1000,
+                        target_height=224,
+                        target_width=224,
+                    )
+                    look_down_depth = torch.as_tensor(np.ascontiguousarray(look_down_depth)).float()
+                    look_down_depth[look_down_depth > 5.0] = 5.0
+                else:
+                    image = image.resize((self.model_args.resize_w, self.model_args.resize_h))
+                    rgb_list.append(image)
+                    raw_rgb_list.append(rgb)
+                    raw_depth_list.append(front_depth)
+                    agent_state_front = self.env._env.sim.get_agent_state()
+                    camera_pose_list.append(
+                        {
+                            "position": [float(v) for v in agent_state_front.position.tolist()],
+                            "quaternion_wxyz": self._quat_to_wxyz(agent_state_front.rotation),
+                        }
+                    )
+                    yaw_list.append(camera_yaw)
+                    ep_positions.append(np.array(agent_state_front.position))
+
+                    down_observations, _, _, _ = self.env.step(action_code.LOOKDOWN)
+                    down_observations, _, _, _ = self.env.step(action_code.LOOKDOWN)
+
+                    look_down_image = Image.fromarray(down_observations["rgb"]).convert('RGB')
+                    depth = down_observations["depth"]
+                    depth = filter_depth(depth.reshape(depth.shape[:2]), blur_type=None)
+                    depth = depth * (self._max_depth - self._min_depth) + self._min_depth
+                    depth = depth * 1000
+                    look_down_depth, resize_shape = preprocess_depth_image_v2(
+                        Image.fromarray(depth.astype(np.uint16), mode='I;16'),
+                        do_depth_scale=True,
+                        depth_scale=1000,
+                        target_height=224,
+                        target_width=224,
+                    )
+                    look_down_depth = torch.as_tensor(np.ascontiguousarray(look_down_depth)).float()
+                    look_down_depth[look_down_depth > 5.0] = 5.0
+
+                    self.env.step(action_code.LOOKUP)
+                    self.env.step(action_code.LOOKUP)
+
+                if len(action_seq) == 0 and pixel_goal is None:
+                    if action == action_code.LOOKDOWN:
+                        # last action is look down
+                        sources = [{"from": "human", "value": ""}, {"from": "gpt", "value": ""}]
+                        input_images += [look_down_image]
+                        messages.append(
+                            {'role': 'assistant', 'content': [{'type': 'text', 'text': llm_outputs}]}  # noqa: F405
+                        )
+                        input_img_id = -1
+                    else:
+                        sources = copy.deepcopy(self.conversation)
+                        sources[0]["value"] = sources[0]["value"].replace(
+                            '<instruction>.', episode.instruction.instruction_text[:-1]
+                        )
+                        cur_images = rgb_list[-1:]
+                        if step_id == 0:
+                            history_id = []
+                        else:
+                            history_id = np.unique(
+                                np.linspace(0, step_id - 1, self.num_history, dtype=np.int32)
+                            ).tolist()
+                            placeholder = (DEFAULT_IMAGE_TOKEN + '\n') * len(history_id)
+                            sources[0]["value"] += f' These are your historical observations: {placeholder}.'
+
+                        history_id = sorted(history_id)
+                        input_images = [rgb_list[i] for i in history_id] + cur_images
+                        input_img_id = 0
+
+                    prompt = random.choice(self.conjunctions) + DEFAULT_IMAGE_TOKEN
+                    sources[0]["value"] += f" {prompt}."
+                    prompt_instruction = copy.deepcopy(sources[0]["value"])
+                    parts = split_and_clean(prompt_instruction)
+
+                    content = []
+                    for i in range(len(parts)):
+                        if parts[i] == "<image>":
+                            content.append({"type": "image", "image": input_images[input_img_id]})
+                            input_img_id += 1
+                        else:
+                            content.append({"type": "text", "text": parts[i]})
+
+                    messages.append({'role': 'user', 'content': content})
+
+                    text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+
+                    gen_start_t = time.perf_counter()
+                    inputs = self.processor(text=[text], images=input_images, return_tensors="pt").to(self.model.device)
+                    prep_end_t = time.perf_counter()
+
+                    # ── VLN-Cache: feed current frame data ──
+                    if self._vln_cache is not None and len(camera_pose_list) > 0:
+                        _depth_m = front_depth / 1000.0  # mm → metres
+                        _pose = camera_pose_list[-1]
+                        self._vln_cache.set_frame(
+                            depth_m=_depth_m,
+                            pos=_pose["position"],
+                            quat_wxyz=_pose["quaternion_wxyz"],
+                            inputs=inputs,
+                        )
+
+                    with torch.no_grad():
+                        output_ids = self.model.generate(
+                            **inputs,
+                            max_new_tokens=128,
+                            do_sample=False,
+                            use_cache=True,
+                            past_key_values=None,
+                            return_dict_in_generate=True,
+                        ).sequences
+                    gen_end_t = time.perf_counter()
+                    ep_step_latencies.append(gen_end_t - gen_start_t)  # includes preprocess + generate
+
+                    # --- token accounting ---
+                    # output_ids includes: [prompt tokens] + [generated tokens]
+                    prompt_len = int(inputs.input_ids.shape[1])
+                    total_len = int(output_ids.shape[1])
+                    gen_len = max(total_len - prompt_len, 0)
+                    sys2_prompt_lens.append(prompt_len)
+                    sys2_total_lens.append(total_len)
+                    sys2_gen_lens.append(gen_len)
+                    print(
+                        f"[token_stats] step_id {step_id} prompt={prompt_len} gen={gen_len} total={total_len}",
+                        flush=True,
+                    )
+
+                    llm_outputs = self.processor.tokenizer.decode(
+                        output_ids[0][inputs.input_ids.shape[1] :], skip_special_tokens=True
+                    )
+                    decode_end_t = time.perf_counter()
+                    print('step_id:', step_id, 'output text:', llm_outputs)
+
+                    if self.analysis_writer is not None and self.analysis_save_patch_tokens:
+                        patch_tokens = self.analysis_visual_hook.consume()
+                        pending_patch_token_path = self.analysis_writer.dump_patch_tokens(
+                            scene_id=scene_id,
+                            episode_id=episode_id,
+                            step_id=step_id,
+                            tokens=patch_tokens,
+                        )
+
+                    if (
+                        self.analysis_writer is not None
+                        and self.analysis_probe_attn
+                        and (step_id % max(self.analysis_probe_every_n_steps, 1) == 0)
+                    ):
+                        saliency_probe = probe_language_vision_saliency(self.model, inputs)
+                        if saliency_probe.get("ok", False):
+                            saliency_vec = saliency_probe.pop("saliency_vector")
+                            pending_saliency_path = self.analysis_writer.dump_saliency(
+                                scene_id=scene_id,
+                                episode_id=episode_id,
+                                step_id=step_id,
+                                saliency=saliency_vec,
+                            )
+                            self.analysis_writer.log_saliency(
+                                {
+                                    "scene_id": scene_id,
+                                    "episode_id": episode_id,
+                                    "step_id": step_id,
+                                    "instruction": episode_instruction,
+                                    "saliency_path": pending_saliency_path,
+                                    **saliency_probe,
+                                }
+                            )
+
+                    if self.analysis_writer is not None and self.analysis_collect_s2_log:
+                        self.analysis_writer.log_s2(
+                            {
+                                "scene_id": scene_id,
+                                "episode_id": episode_id,
+                                "step_id": step_id,
+                                "mode": "dual_system",
+                                "prompt_len": prompt_len,
+                                "gen_len": gen_len,
+                                "total_len": total_len,
+                                "preprocess_ms": (prep_end_t - gen_start_t) * 1000,
+                                "generate_ms": (gen_end_t - prep_end_t) * 1000,
+                                "decode_ms": (decode_end_t - gen_end_t) * 1000,
+                            }
+                        )
+
+                    if bool(re.search(r'\d', llm_outputs)):  # output pixel goal
+                        forward_action = 0
+                        coord = [int(c) for c in re.findall(r'\d+', llm_outputs)]
+
+                        pixel_goal = [int(coord[1]), int(coord[0])]
+
+                        # look down --> horizontal
+                        self.env.step(action_code.LOOKUP)
+                        self.env.step(action_code.LOOKUP)
+
+                        local_actions = []
+                        pixel_values = inputs.pixel_values
+                        image_grid_thw = torch.cat([thw.unsqueeze(0) for thw in inputs.image_grid_thw], dim=0)
+
+                        with torch.no_grad():
+                            traj_latents = self.model.generate_latents(output_ids, pixel_values, image_grid_thw)
+
+                        # prepocess align with navdp
+                        image_dp = torch.tensor(np.array(look_down_image.resize((224, 224)))).to(torch.bfloat16) / 255
+                        pix_goal_image = copy.copy(image_dp)
+                        images_dp = torch.stack([pix_goal_image, image_dp]).unsqueeze(0).to(self.device)
+                        depth_dp = look_down_depth.unsqueeze(-1).to(torch.bfloat16)
+                        pix_goal_depth = copy.copy(depth_dp)
+                        depths_dp = torch.stack([pix_goal_depth, depth_dp]).unsqueeze(0).to(self.device)
+
+                        with torch.no_grad():
+                            dp_actions = self.model.generate_traj(traj_latents, images_dp, depths_dp)
+
+                        action_list = traj_to_actions(dp_actions)
+                        if len(action_list) < MAX_STEPS:
+                            action_list += [0] * (MAX_STEPS - len(action_list))
+
+                        local_actions = action_list
+                        if len(local_actions) >= MAX_LOCAL_STEPS:
+                            local_actions = local_actions[:MAX_LOCAL_STEPS]
+
+                        action = local_actions[0]
+                        if action == action_code.STOP:
+                            pixel_goal = None
+                            output_ids = None
+                            action = action_code.LEFT
+                            observations, _, done, _ = self.env.step(action)
+                            step_id += 1
+                            messages = []
+                            continue
+                        print('predicted goal', pixel_goal, flush=True)
+
+                    else:
+                        action_seq = self.parse_actions(llm_outputs)
+                        print('actions', action_seq, flush=True)
+
+                if len(action_seq) != 0:
+                    action = action_seq[0]
+                    action_seq.pop(0)
+                elif pixel_goal is not None:
+                    if len(local_actions) == 0:
+                        # navdp
+                        local_actions = []
+                        image_dp = torch.tensor(np.array(look_down_image.resize((224, 224)))).to(torch.bfloat16) / 255
+
+                        images_dp = torch.stack([pix_goal_image, image_dp]).unsqueeze(0).to(self.device)
+                        depth_dp = look_down_depth.unsqueeze(-1).to(torch.bfloat16)
+
+                        depths_dp = torch.stack([pix_goal_depth, depth_dp]).unsqueeze(0).to(self.device)
+                        with torch.no_grad():
+                            dp_actions = self.model.generate_traj(traj_latents, images_dp, depths_dp)
+
+                        action_list = traj_to_actions(dp_actions)
+                        if len(action_list) < MAX_STEPS:
+                            action_list += [0] * (MAX_STEPS - len(action_list))
+
+                        local_actions = action_list
+                        if len(local_actions) >= MAX_LOCAL_STEPS:
+                            local_actions = local_actions[:MAX_LOCAL_STEPS]
+                        print("local_actions", local_actions)
+                        action = local_actions.pop(0)
+                    else:
+                        action = local_actions.pop(0)
+
+                    forward_action += 1
+                    if forward_action > MAX_STEPS:
+                        pixel_goal = None
+                        output_ids = None
+                        messages = []
+                        step_id += 1
+                        forward_action = 0
+                        local_actions = []
+                        continue
+                    if action == action_code.STOP:
+                        pixel_goal = None
+                        output_ids = None
+                        messages = []
+                        step_id += 1
+                        forward_action = 0
+                        local_actions = []
+                        continue
+                else:
+                    action = 0
+
+                info = self.env.get_metrics()
+
+                if self.analysis_writer is not None:
+                    agent_state = self.env._env.sim.get_agent_state()
+                    agent_pos = [float(v) for v in agent_state.position.tolist()]
+                    agent_quat = self._quat_to_wxyz(agent_state.rotation)
+                    delta_trans = 0.0
+                    delta_yaw = 0.0
+                    if prev_camera_pose is not None:
+                        delta_trans = float(np.linalg.norm(np.array(agent_pos) - np.array(prev_camera_pose["pos"])))
+                        delta_yaw = float(abs((camera_yaw or 0.0) - prev_camera_pose["yaw"]))
+
+                    rgbd_paths = self.analysis_writer.dump_rgbd(
+                        scene_id=scene_id,
+                        episode_id=episode_id,
+                        step_id=step_id,
+                        rgb=raw_rgb_list[-1] if len(raw_rgb_list) > 0 else rgb,
+                        depth=depth,
+                    )
+
+                    similarity = {}
+                    if len(raw_rgb_list) >= 2:
+                        intrinsic = np.array(
+                            [[self._fx, 0.0, raw_rgb_list[-1].shape[1] / 2], [0.0, self._fy, raw_rgb_list[-1].shape[0] / 2], [0.0, 0.0, 1.0]],
+                            dtype=np.float32,
+                        )
+                        prev_yaw = yaw_list[-2] if len(yaw_list) >= 2 else None
+                        curr_yaw = yaw_list[-1] if len(yaw_list) >= 1 else None
+                        delta_yaw = None
+                        if self.analysis_alignment_enable and prev_yaw is not None and curr_yaw is not None:
+                            delta_yaw = float((float(prev_yaw) - float(curr_yaw) + np.pi) % (2.0 * np.pi) - np.pi)
+
+                        similarity = compute_patch_cosine_stats(
+                            prev_rgb=raw_rgb_list[-2],
+                            curr_rgb=raw_rgb_list[-1],
+                            patch_size=self.analysis_patch_size,
+                            resize_hw=(self.analysis_similarity_resize, self.analysis_similarity_resize),
+                            delta_yaw=delta_yaw,
+                            intrinsic=intrinsic if delta_yaw is not None else None,
+                            prev_depth=raw_depth_list[-2] if len(raw_depth_list) >= 2 else None,
+                            curr_depth=raw_depth_list[-1] if len(raw_depth_list) >= 1 else None,
+                            prev_pose=camera_pose_list[-2] if len(camera_pose_list) >= 2 else None,
+                            curr_pose=camera_pose_list[-1] if len(camera_pose_list) >= 1 else None,
+                            alignment_method=self.analysis_alignment_method,
+                            neighbor_radius=self.analysis_alignment_neighbor_radius,
+                            occlusion_eps_mm=self.analysis_alignment_occlusion_eps_mm,
+                            tau=self.analysis_similarity_tau,
+                        )
+
+                    self.analysis_writer.log_step(
+                        {
+                            "scene_id": scene_id,
+                            "episode_id": episode_id,
+                            "step_id": step_id,
+                            "mode": "dual_system",
+                            "action": int(action),
+                            "gps": [float(x), float(y)],
+                            "yaw": None if camera_yaw is None else float(camera_yaw),
+                            "pose": {
+                                "position": agent_pos,
+                                "quaternion_wxyz": agent_quat,
+                            },
+                            "motion": {
+                                "delta_yaw": float(delta_yaw),
+                                "delta_trans": float(delta_trans),
+                                "is_turn_action": bool(int(action) in [int(action_code.LEFT), int(action_code.RIGHT)]),
+                            },
+                            "instruction": episode_instruction,
+                            "rgb_path": rgbd_paths["rgb"],
+                            "depth_path": rgbd_paths["depth"],
+                            "patch_token_path": pending_patch_token_path,
+                            "saliency_path": pending_saliency_path,
+                            "similarity": similarity,
+                            "metrics": {
+                                "distance_to_goal": float(info.get("distance_to_goal", 0.0)),
+                                "spl": float(info.get("spl", 0.0)),
+                                "success": float(info.get("success", 0.0)),
+                            },
+                        }
+                    )
+                    pending_patch_token_path = None
+                    pending_saliency_path = None
+                    prev_camera_pose = {"pos": agent_pos, "yaw": float(camera_yaw or 0.0)}
+
+                if info['top_down_map'] is not None and self.save_video:
+                    frame = observations_to_image({'rgb': np.asarray(save_raw_image)}, info)
+                    if pixel_goal is not None and flag:
+                        cv2.circle(frame, (pixel_goal[0], pixel_goal[1]), radius=8, color=(255, 0, 0), thickness=-1)
+                    vis_frames.append(frame)
+
+                print("step_id", step_id, "action", action)
+
+                if action == action_code.LOOKDOWN:
+                    self.env.step(action)
+                    observations, _, done, _ = self.env.step(action)
+                    flag = True
+                else:
+                    observations, _, done, _ = self.env.step(action)
+                    step_id += 1
+                    messages = []
+                    flag = False
+
+            # ---------- 3. End of episode -----------
+            # collect the metric result of this episode and write progress to the output_path/progress.json
+
+            process_bar.update(1)
+            finished_episodes += 1
+
+            # After the episode finishes, collect metrics:
+            metrics = self.env.get_metrics()
+
+            sucs.append(metrics['success'])
+            spls.append(metrics['spl'])
+            oss.append(metrics['oracle_success'])
+            nes.append(metrics["distance_to_goal"])
+            if 'ndtw' in metrics:
+                ndtw.append(metrics["ndtw"])
+
+            # ── TL (trajectory length) from Habitat PathLength measure ──
+            ep_tl = float(metrics.get('path_length', 0.0))
+            tls.append(ep_tl)
+
+            # ── ONE (oracle navigation error) ──
+            ep_one = float(metrics.get('oracle_navigation_error', float('inf')))
+            ones.append(ep_one)
+
+            # ── StR (stuck rate): stuck if consecutive 5 steps with < 0.05 m total displacement ──
+            _stuck = 0.0
+            _K_stuck = 5
+            if len(ep_positions) >= _K_stuck:
+                for _si in range(len(ep_positions) - _K_stuck + 1):
+                    _window_disp = sum(
+                        float(np.linalg.norm(ep_positions[_si + _j + 1] - ep_positions[_si + _j]))
+                        for _j in range(_K_stuck - 1)
+                    )
+                    if _window_disp < 0.05:
+                        _stuck = 1.0
+                        break
+            strs.append(_stuck)
+
+            # ── Efficiency metrics ──
+            _peak_gpu_mb = torch.cuda.max_memory_allocated(self.device) / (1024 * 1024)
+            _mean_latency_ms = float(np.mean(ep_step_latencies) * 1000) if ep_step_latencies else 0.0
+            _mean_latency_s = float(np.mean(ep_step_latencies)) if ep_step_latencies else 0.0
+            _control_freq = 1.0 / _mean_latency_s if _mean_latency_s > 0 else 0.0
+
+            # ── VLN-Cache reuse & overhead ──
+            if self._vln_cache is not None:
+                _cs = self._vln_cache.get_episode_stats()
+                cache_reuses.append(_cs.get('mean_reuse_ratio', 0.0))
+                cache_ohs.append(_cs.get('cache_overhead_ms_mean', 0.0))
+
+            latencies.append(_mean_latency_ms)
+            freqs.append(_control_freq)
+            gpu_mems.append(_peak_gpu_mb)
+
+            print(
+                f"scene_episode {scene_id}_{episode_id:04d} success: {metrics['success']}, "
+                f"spl: {metrics['spl']}, os: {metrics['oracle_success']}, "
+                f"ne: {metrics['distance_to_goal']}"
+            )
+
+            # Write per-episode progress.json entry (still per-rank)
+            result = {
+                "scene_id": scene_id,
+                "episode_id": episode_id,
+                "success": metrics["success"],
+                "spl": metrics["spl"],
+                "os": metrics['oracle_success'],
+                "ne": metrics["distance_to_goal"],
+                "steps": step_id,
+                "episode_instruction": episode_instruction,
+                "tl": ep_tl,
+                "one": ep_one,
+                "str": _stuck,
+                "fr": 0.0,
+                "hcr": 0.0,
+                "action_latency_ms": _mean_latency_ms,
+                "control_freq_hz": _control_freq,
+                "peak_gpu_mb": _peak_gpu_mb,
+            }
+
+            # summarize system2->system1 token usage for this episode
+            if len(sys2_gen_lens) > 0:
+                result.update(
+                    {
+                        "system2_calls": len(sys2_gen_lens),
+                        "system2_prompt_tokens_mean": float(np.mean(sys2_prompt_lens)),
+                        "system2_gen_tokens_mean": float(np.mean(sys2_gen_lens)),
+                        "system2_gen_tokens_max": int(np.max(sys2_gen_lens)),
+                        "system2_total_tokens_mean": float(np.mean(sys2_total_lens)),
+                        "system2_total_tokens_max": int(np.max(sys2_total_lens)),
+                    }
+                )
+            if 'ndtw' in metrics:
+                result['ndtw'] = metrics['ndtw']
+
+            # ── VLN-Cache: per-episode stats ──
+            if self._vln_cache is not None:
+                cache_stats = self._vln_cache.get_episode_stats()
+                result['vln_cache'] = cache_stats
+                print(f"  [VLN-Cache] frames={cache_stats['n_frames']}  "
+                      f"mean_reuse={cache_stats['mean_reuse_ratio']:.1%}")
+
+            # save current progress
+            os.makedirs(self.output_path, exist_ok=True)
+            with open(os.path.join(self.output_path, 'progress.json'), 'a') as f:
+                f.write(json.dumps(result) + "\n")
+
+            if self.analysis_writer is not None:
+                self.analysis_writer.log_episode(result)
+
+            # save video (save both success and failure; annotate filename)
+            if self.save_video and len(vis_frames) > 0:
+                status_tag = 'success' if metrics.get('success', 0.0) == 1.0 else 'fail'
+                images_to_video(
+                    vis_frames,
+                    os.path.join(self.output_path, f'vis_{self.epoch}', f'{scene_id}'),
+                    f'{episode_id:04d}_{status_tag}',
+                    fps=6,
+                    quality=5,
+                )
+            vis_frames.clear()
+
+        self.env.close()
+
+        return (
+            torch.tensor(sucs).to(self.device),
+            torch.tensor(spls).to(self.device),
+            torch.tensor(oss).to(self.device),
+            torch.tensor(nes).to(self.device),
+            torch.tensor(ndtw).to(self.device) if ndtw else None,
+            torch.tensor(tls).to(self.device),
+            torch.tensor(strs).to(self.device),
+            torch.tensor(ones).to(self.device),
+            torch.tensor(cache_reuses).to(self.device) if cache_reuses else None,
+            torch.tensor(cache_ohs).to(self.device) if cache_ohs else None,
+            torch.tensor(latencies).to(self.device) if latencies else None,
+            torch.tensor(freqs).to(self.device) if freqs else None,
+            torch.tensor(gpu_mems).to(self.device) if gpu_mems else None,
+        )
+
+    def _run_eval_system2(self) -> tuple:
+        self.model.eval()
+
+        # resume from previous results
+        sucs, spls, oss, nes, ndtw, _tls, _strs, _ones, _cr, _co = self.resume_from_output_path()
+
+        # Episode loop is now driven by env.reset() + env.is_running
+        target_episodes = len(self.env.episodes)
+        if self.max_episodes > 0:
+            target_episodes = min(target_episodes, self.max_episodes)
+        process_bar = tqdm.tqdm(total=target_episodes, desc=f"Eval Epoch {self.epoch} Rank {self.rank}")
+        finished_episodes = 0
+
+        while self.env.is_running:
+            if self.max_episodes > 0 and finished_episodes >= self.max_episodes:
+                break
+
+            # ------------ 1. Start of episode ------------
+            observations = self.env.reset()
+            if not self.env.is_running or observations is None:
+                break
+
+            # ---- episode meta (scene_id, episode_id, instruction) ----
+            # we get it from the underlying habitat env
+            episode = self.env.get_current_episode()
+            scene_id = episode.scene_id.split('/')[-2]
+            episode_id = int(episode.episode_id)
+            episode_instruction = episode.instruction.instruction_text
+            print("episode start", episode_instruction)
+
+            agent_state = self.env._env.sim.get_agent_state()
+            rotation = agent_state.rotation
+            translation = agent_state.position
+            rotation_matrix = quaternion.as_rotation_matrix(rotation)
+            transformation_matrix = np.eye(4)
+            transformation_matrix[:3, :3] = rotation_matrix
+            transformation_matrix[:3, 3] = translation
+
+            agent = ShortestPathFollower(self.env._env.sim, 0.25, False)
+
+            intrinsic_matrix = get_intrinsic_matrix(
+                self.config.habitat.simulator.agents.main_agent.sim_sensors.rgb_sensor
+            )
+
+            # save first frame per rank to validate sim quality
+            os.makedirs(os.path.join(self.output_path, f'check_sim_{self.epoch}'), exist_ok=True)
+            Image.fromarray(observations['rgb']).save(
+                os.path.join(self.output_path, f'check_sim_{self.epoch}', f'rgb_{self.rank}.jpg')
+            )
+
+            vis_frames = []
+            step_id = 0
+
+            if self.save_video:
+                os.makedirs(os.path.join(self.output_path, f'vis_{self.epoch}', f'{scene_id}'), exist_ok=True)
+            initial_height = self.env._env.sim.get_agent_state().position[1]
+
+            rgb_list = []
+            raw_rgb_list = []
+            raw_depth_list = []
+            camera_pose_list = []
+            yaw_list = []
+            action_seq = []
+            input_images = []
+            output_ids = None
+            llm_outputs = ""
+            goal = None
+            action = None
+            messages = []
+
+            done = False
+            flag = False
+            prev_camera_pose = None
+            # ── per-step position tracking for TL / StR ──
+            ep_positions = []  # list of np.array[3]
+            # ── per-step efficiency tracking ──
+            ep_step_latencies = []  # action latency per step (seconds)
+            torch.cuda.reset_peak_memory_stats(self.device)
+            pending_patch_token_path = None
+            pending_saliency_path = None
+
+            # ---------- 2. Episode step loop -----------
+            while (not done) and (step_id <= self.max_steps_per_episode):
+                # refactor agent get action
+                rgb = observations["rgb"]
+                depth = observations["depth"]
+                x, y = observations["gps"]
+                camera_yaw = observations["compass"][0]
+                depth = filter_depth(depth.reshape(depth.shape[:2]), blur_type=None)
+                depth = depth * (self._max_depth - self._min_depth) + self._min_depth
+                depth = depth * 1000
+                front_depth = depth.copy()
+
+                agent_state = self.env._env.sim.get_agent_state()
+                height = agent_state.position[1] - initial_height  # Habitat GPS makes west negative, so flip y
+                camera_position = np.array([x, -y, self._camera_height + height])
+                tf_camera_to_episodic = (
+                    xyz_yaw_pitch_to_tf_matrix(camera_position, camera_yaw, np.deg2rad(30)) @ get_axis_align_matrix()
+                )
+
+                image = Image.fromarray(rgb).convert('RGB')
+                save_raw_image = image.copy()
+
+                if action == action_code.LOOKDOWN:
+                    look_down_image = image
+                    save_raw_image = look_down_image.copy()
+                else:
+                    image = image.resize((self.model_args.resize_w, self.model_args.resize_h))
+                    rgb_list.append(image)
+                    raw_rgb_list.append(rgb)
+                    raw_depth_list.append(front_depth)
+                    agent_state_front = self.env._env.sim.get_agent_state()
+                    camera_pose_list.append(
+                        {
+                            "position": [float(v) for v in agent_state_front.position.tolist()],
+                            "quaternion_wxyz": self._quat_to_wxyz(agent_state_front.rotation),
+                        }
+                    )
+                    yaw_list.append(camera_yaw)
+
+                if len(action_seq) == 0 and goal is None:
+                    if action == action_code.LOOKDOWN:
+                        # last action is look down
+                        sources = [{"from": "human", "value": ""}, {"from": "gpt", "value": ""}]
+                        input_images += [look_down_image]
+                        messages.append(
+                            {'role': 'assistant', 'content': [{'type': 'text', 'text': llm_outputs}]}  # noqa: F405
+                        )
+                        input_img_id = -1
+                    else:
+                        sources = copy.deepcopy(self.conversation)
+                        sources[0]["value"] = sources[0]["value"].replace(
+                            '<instruction>.', episode.instruction.instruction_text[:-1]
+                        )
+                        cur_images = rgb_list[-1:]
+                        if step_id == 0:
+                            history_id = []
+                        else:
+                            history_id = np.unique(
+                                np.linspace(0, step_id - 1, self.num_history, dtype=np.int32)
+                            ).tolist()
+                            placeholder = (DEFAULT_IMAGE_TOKEN + '\n') * len(history_id)
+                            sources[0]["value"] += f' These are your historical observations: {placeholder}.'
+
+                        history_id = sorted(history_id)
+                        input_images = [rgb_list[i] for i in history_id] + cur_images
+                        input_img_id = 0
+
+                    prompt = random.choice(self.conjunctions) + DEFAULT_IMAGE_TOKEN
+                    sources[0]["value"] += f" {prompt}."
+                    prompt_instruction = copy.deepcopy(sources[0]["value"])
+                    parts = split_and_clean(prompt_instruction)
+
+                    content = []
+                    for i in range(len(parts)):
+                        if parts[i] == "<image>":
+                            content.append({"type": "image", "image": input_images[input_img_id]})
+                            input_img_id += 1
+                        else:
+                            content.append({"type": "text", "text": parts[i]})
+
+                    messages.append({'role': 'user', 'content': content})
+
+                    text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+
+                    gen_start_t = time.perf_counter()
+                    inputs = self.processor(text=[text], images=input_images, return_tensors="pt").to(self.model.device)
+                    prep_end_t = time.perf_counter()
+
+                    with torch.no_grad():
+                        output_ids = self.model.generate(
+                            **inputs,
+                            max_new_tokens=128,
+                            do_sample=False,
+                            use_cache=True,
+                            past_key_values=None,
+                            return_dict_in_generate=True,
+                        ).sequences
+                    gen_end_t = time.perf_counter()
+
+                    prompt_len = int(inputs.input_ids.shape[1])
+                    total_len = int(output_ids.shape[1])
+                    gen_len = max(total_len - prompt_len, 0)
+
+                    llm_outputs = self.processor.tokenizer.decode(
+                        output_ids[0][inputs.input_ids.shape[1] :], skip_special_tokens=True
+                    )
+                    decode_end_t = time.perf_counter()
+                    print('step_id:', step_id, 'output text:', llm_outputs)
+
+                    if self.analysis_writer is not None and self.analysis_save_patch_tokens:
+                        patch_tokens = self.analysis_visual_hook.consume()
+                        pending_patch_token_path = self.analysis_writer.dump_patch_tokens(
+                            scene_id=scene_id,
+                            episode_id=episode_id,
+                            step_id=step_id,
+                            tokens=patch_tokens,
+                        )
+
+                    if (
+                        self.analysis_writer is not None
+                        and self.analysis_probe_attn
+                        and (step_id % max(self.analysis_probe_every_n_steps, 1) == 0)
+                    ):
+                        saliency_probe = probe_language_vision_saliency(self.model, inputs)
+                        if saliency_probe.get("ok", False):
+                            saliency_vec = saliency_probe.pop("saliency_vector")
+                            pending_saliency_path = self.analysis_writer.dump_saliency(
+                                scene_id=scene_id,
+                                episode_id=episode_id,
+                                step_id=step_id,
+                                saliency=saliency_vec,
+                            )
+                            self.analysis_writer.log_saliency(
+                                {
+                                    "scene_id": scene_id,
+                                    "episode_id": episode_id,
+                                    "step_id": step_id,
+                                    "instruction": episode_instruction,
+                                    "saliency_path": pending_saliency_path,
+                                    **saliency_probe,
+                                }
+                            )
+
+                    if self.analysis_writer is not None and self.analysis_collect_s2_log:
+                        self.analysis_writer.log_s2(
+                            {
+                                "scene_id": scene_id,
+                                "episode_id": episode_id,
+                                "step_id": step_id,
+                                "mode": "system2",
+                                "prompt_len": prompt_len,
+                                "gen_len": gen_len,
+                                "total_len": total_len,
+                                "preprocess_ms": (prep_end_t - gen_start_t) * 1000,
+                                "generate_ms": (gen_end_t - prep_end_t) * 1000,
+                                "decode_ms": (decode_end_t - gen_end_t) * 1000,
+                            }
+                        )
+
+                    if bool(re.search(r'\d', llm_outputs)):  # output pixel goal
+                        forward_action = 0
+                        coord = [int(c) for c in re.findall(r'\d+', llm_outputs)]
+
+                        pixel_goal = [int(coord[1]), int(coord[0])]
+
+                        # look down --> horizontal
+                        self.env.step(action_code.LOOKUP)
+                        self.env.step(action_code.LOOKUP)
+
+                        goal = pixel_to_gps(pixel_goal, depth / 1000, intrinsic_matrix, tf_camera_to_episodic)
+
+                        goal = (transformation_matrix @ np.array([-goal[1], 0, -goal[0], 1]))[:3]
+
+                        if not self.env._env.sim.pathfinder.is_navigable(np.array(goal)):
+                            goal = np.array(self.env._env.sim.pathfinder.snap_point(np.array(goal)))
+
+                        action = agent.get_next_action(goal)
+                        if action == action_code.STOP:
+                            goal = None
+                            output_ids = None
+                            action = action_code.LEFT  # random action to avoid deadlock
+                            observations, _, done, _ = self.env.step(action)
+                            step_id += 1
+                            messages = []
+                            continue
+                        print('predicted goal', pixel_goal, goal, flush=True)
+
+                    else:
+                        action_seq = self.parse_actions(llm_outputs)
+                        print('actions', action_seq, flush=True)
+
+                if len(action_seq) != 0:
+                    action = action_seq[0]
+                    action_seq.pop(0)
+                elif goal is not None:
+                    action = agent.get_next_action(goal)
+                    action = action.detach().cpu().numpy()[0] if isinstance(action, torch.Tensor) else action
+                    action = action[0] if hasattr(action, "__len__") else action
+
+                    forward_action += 1
+                    if forward_action > MAX_STEPS:
+                        goal = None
+                        output_ids = None
+                        messages = []
+                        step_id += 1
+                        forward_action = 0
+                        continue
+                    if action == action_code.STOP:
+                        goal = None
+                        output_ids = None
+                        messages = []
+                        step_id += 1
+                        forward_action = 0
+                        continue
+                else:
+                    action = 0
+
+                info = self.env.get_metrics()
+
+                if self.analysis_writer is not None:
+                    agent_state = self.env._env.sim.get_agent_state()
+                    agent_pos = [float(v) for v in agent_state.position.tolist()]
+                    agent_quat = self._quat_to_wxyz(agent_state.rotation)
+                    delta_trans = 0.0
+                    delta_yaw_motion = 0.0
+                    if prev_camera_pose is not None:
+                        delta_trans = float(np.linalg.norm(np.array(agent_pos) - np.array(prev_camera_pose["pos"])))
+                        delta_yaw_motion = float(abs((camera_yaw or 0.0) - prev_camera_pose["yaw"]))
+
+                    rgbd_paths = self.analysis_writer.dump_rgbd(
+                        scene_id=scene_id,
+                        episode_id=episode_id,
+                        step_id=step_id,
+                        rgb=raw_rgb_list[-1] if len(raw_rgb_list) > 0 else rgb,
+                        depth=depth,
+                    )
+
+                    similarity = {}
+                    if len(raw_rgb_list) >= 2:
+                        intrinsic = np.array(
+                            [[self._fx, 0.0, raw_rgb_list[-1].shape[1] / 2], [0.0, self._fy, raw_rgb_list[-1].shape[0] / 2], [0.0, 0.0, 1.0]],
+                            dtype=np.float32,
+                        )
+                        prev_yaw = yaw_list[-2] if len(yaw_list) >= 2 else None
+                        curr_yaw = yaw_list[-1] if len(yaw_list) >= 1 else None
+                        delta_yaw = None
+                        if self.analysis_alignment_enable and prev_yaw is not None and curr_yaw is not None:
+                            delta_yaw = float((float(prev_yaw) - float(curr_yaw) + np.pi) % (2.0 * np.pi) - np.pi)
+
+                        similarity = compute_patch_cosine_stats(
+                            prev_rgb=raw_rgb_list[-2],
+                            curr_rgb=raw_rgb_list[-1],
+                            patch_size=self.analysis_patch_size,
+                            resize_hw=(self.analysis_similarity_resize, self.analysis_similarity_resize),
+                            delta_yaw=delta_yaw,
+                            intrinsic=intrinsic if delta_yaw is not None else None,
+                            prev_depth=raw_depth_list[-2] if len(raw_depth_list) >= 2 else None,
+                            curr_depth=raw_depth_list[-1] if len(raw_depth_list) >= 1 else None,
+                            prev_pose=camera_pose_list[-2] if len(camera_pose_list) >= 2 else None,
+                            curr_pose=camera_pose_list[-1] if len(camera_pose_list) >= 1 else None,
+                            alignment_method=self.analysis_alignment_method,
+                            neighbor_radius=self.analysis_alignment_neighbor_radius,
+                            occlusion_eps_mm=self.analysis_alignment_occlusion_eps_mm,
+                            tau=self.analysis_similarity_tau,
+                        )
+
+                    self.analysis_writer.log_step(
+                        {
+                            "scene_id": scene_id,
+                            "episode_id": episode_id,
+                            "step_id": step_id,
+                            "mode": "system2",
+                            "action": int(action),
+                            "gps": [float(x), float(y)],
+                            "yaw": float(camera_yaw),
+                            "pose": {
+                                "position": agent_pos,
+                                "quaternion_wxyz": agent_quat,
+                            },
+                            "motion": {
+                                "delta_yaw": float(delta_yaw_motion),
+                                "delta_trans": float(delta_trans),
+                                "is_turn_action": bool(int(action) in [int(action_code.LEFT), int(action_code.RIGHT)]),
+                            },
+                            "instruction": episode_instruction,
+                            "rgb_path": rgbd_paths["rgb"],
+                            "depth_path": rgbd_paths["depth"],
+                            "patch_token_path": pending_patch_token_path,
+                            "saliency_path": pending_saliency_path,
+                            "similarity": similarity,
+                            "metrics": {
+                                "distance_to_goal": float(info.get("distance_to_goal", 0.0)),
+                                "spl": float(info.get("spl", 0.0)),
+                                "success": float(info.get("success", 0.0)),
+                            },
+                        }
+                    )
+                    pending_patch_token_path = None
+                    pending_saliency_path = None
+                    prev_camera_pose = {"pos": agent_pos, "yaw": float(camera_yaw or 0.0)}
+
+                if info['top_down_map'] is not None and self.save_video:
+                    frame = observations_to_image({'rgb': np.asarray(save_raw_image)}, info)
+                    if goal is not None and flag:
+                        cv2.circle(frame, (pixel_goal[0], pixel_goal[1]), radius=8, color=(255, 0, 0), thickness=-1)
+                    vis_frames.append(frame)
+
+                print("step_id", step_id, "action", action)
+
+                if action == action_code.LOOKDOWN:
+                    self.env.step(action)
+                    observations, _, done, _ = self.env.step(action)
+                    flag = True
+                else:
+                    observations, _, done, _ = self.env.step(action)
+                    step_id += 1
+                    messages = []
+                    flag = False
+
+            # ---------- 3. End of episode -----------
+            # collect the metric result of this episode and write progress to the output_path/progress.json
+
+            process_bar.update(1)
+            finished_episodes += 1
+
+            # After the episode finishes, collect metrics:
+            metrics = self.env.get_metrics()
+
+            sucs.append(metrics['success'])
+            spls.append(metrics['spl'])
+            oss.append(metrics['oracle_success'])
+            nes.append(metrics["distance_to_goal"])
+            if 'ndtw' in metrics:
+                ndtw.append(metrics["ndtw"])
+
+            print(
+                f"scene_episode {scene_id}_{episode_id:04d} success: {metrics['success']}, "
+                f"spl: {metrics['spl']}, os: {metrics['oracle_success']}, "
+                f"ne: {metrics['distance_to_goal']}"
+            )
+
+            # Write per-episode result.json entry (still per-rank)
+            result = {
+                "scene_id": scene_id,
+                "episode_id": episode_id,
+                "success": metrics["success"],
+                "spl": metrics["spl"],
+                "os": metrics['oracle_success'],
+                "ne": metrics["distance_to_goal"],
+                "steps": step_id,
+                "episode_instruction": episode_instruction,
+            }
+            if 'ndtw' in metrics:
+                result['ndtw'] = metrics['ndtw']
+
+            os.makedirs(self.output_path, exist_ok=True)
+            with open(os.path.join(self.output_path, 'progress.json'), 'a') as f:
+                f.write(json.dumps(result) + "\n")
+            if self.analysis_writer is not None:
+                self.analysis_writer.log_episode(result)
+            if self.save_video and len(vis_frames) > 0:
+                status_tag = 'success' if metrics.get('success', 0.0) == 1.0 else 'fail'
+                images_to_video(
+                    vis_frames,
+                    os.path.join(self.output_path, f'vis_{self.epoch}', f'{scene_id}'),
+                    f'{episode_id:04d}_{status_tag}',
+                    fps=6,
+                    quality=5,
+                )
+            vis_frames.clear()
+
+        self.env.close()
+
+        return (
+            torch.tensor(sucs).to(self.device),
+            torch.tensor(spls).to(self.device),
+            torch.tensor(oss).to(self.device),
+            torch.tensor(nes).to(self.device),
+            torch.tensor(ndtw).to(self.device) if ndtw else None,
+        )

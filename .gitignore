@@ -1,0 +1,85 @@
+# =========================
+# Core rule: keep source code, ignore heavy/runtime artifacts
+# =========================
+
+# Python cache / build
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Packaging / build outputs
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+
+# =========================
+# Project heavy assets (do not version)
+# =========================
+
+# Datasets / raw data
+/data/
+**/data/raw/
+**/data/cache/
+
+# Model checkpoints / weights / parameter files
+/checkpoints/
+*.ckpt
+*.pth
+*.pt
+*.bin
+*.safetensors
+*.onnx
+
+# Logs and experiment outputs
+/logs/
+*.log
+
+# Evaluation / analysis generated artifacts
+/vis_analyze/data/
+/vis_analyze/reports/
+/vis_analyze_new/data/
+/vis_analyze_new/reports/
+
+# Habitat / runtime caches
+/internnav/vln_cache/__pycache__/
+/internnav/**/__pycache__/
+
+# Temporary run artifacts
+*.tmp
+*.temp
+*.swp
+
+# =========================
+# Keep important project files explicitly
+# =========================
+!README.md
+!pyproject.toml
+!setup.py
+!setup.cfg
+!CITATION.cff
+!RULES.md
+!Outline.md
+!dual_system_workflow.md
+
+# Keep source and config trees
+!/internnav/
+!/scripts/
+!/tests/
+!/docs/
+!/configs/
